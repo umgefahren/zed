@@ -1,6 +1,7 @@
 #![cfg(target_os = "windows")]
 
 mod clipboard;
+pub mod custom_draw;
 mod destination_list;
 mod dialog;
 mod direct_manipulation;
@@ -38,6 +39,7 @@ pub(crate) use vsync::*;
 pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
+pub use custom_draw::{DirectXCustomDraw, DirectXDrawCx, DirectXDrawHandle};
 pub use platform::WindowsPlatform;
 
 pub(crate) use windows::Win32::Foundation::HWND;

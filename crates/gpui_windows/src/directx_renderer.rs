@@ -385,14 +385,7 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
-                // Application-supplied passes are not implemented by the DirectX
-                // renderer yet. `gpui::PaintCustom` payloads are backend-specific,
-                // so this needs a `DirectXDrawHandle` and a context carrying
-                // `ID3D11Device`/`ID3D11DeviceContext`, plus a decision about
-                // which of the immediate-mode context's state a callback may
-                // leave behind. Until then such a payload draws nothing here
-                // rather than failing the frame.
-                PrimitiveBatch::Customs(_customs) => Ok(()),
+                PrimitiveBatch::Customs(range) => self.draw_customs(&scene.customs[range]),
             }
             .with_context(|| {
                 format!(
@@ -725,6 +718,68 @@ impl DirectXRenderer {
             slice::from_ref(&self.globals.sampler),
             sprites.len() as u32,
         )
+    }
+
+    /// Hand each application-supplied pass the immediate context, in scene
+    /// order.
+    ///
+    /// Direct3D 11 has no encoder object to scope a callback's damage: the
+    /// context is the state machine and everything set on it persists. What
+    /// [`set_pipeline_state`] rebinds per batch — shader resource views,
+    /// topology, both shaders, blend state — therefore needs no restoring. The
+    /// render target and viewport are set once per frame in
+    /// [`pre_draw`](Self::pre_draw), and the rasterizer state once per device in
+    /// [`set_rasterizer_state`], so those three are put back after every
+    /// callback. This mirrors what [`draw_paths_to_intermediate`] already does
+    /// when it borrows the render target for the MSAA intermediate.
+    fn draw_customs(&mut self, customs: &[PaintCustom]) -> Result<()> {
+        if customs.is_empty() {
+            return Ok(());
+        }
+
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let viewport_size = Size {
+            width: DevicePixels::from(self.width as i32),
+            height: DevicePixels::from(self.height as i32),
+        };
+
+        for custom in customs {
+            let Some(handle) = custom.payload.downcast_ref::<DirectXDrawHandle>() else {
+                // A payload built for a different renderer backend. Skipped
+                // rather than treated as an error, so that one application can
+                // carry passes for several backends and run against any of them.
+                continue;
+            };
+
+            let rasterizer_state = unsafe { devices.device_context.RSGetState() }.ok();
+
+            handle.0.draw(DirectXDrawCx {
+                device: &devices.device,
+                device_context: &devices.device_context,
+                format: RENDER_TARGET_FORMAT,
+                // The main target is single-sampled; `PATH_MULTISAMPLE_COUNT`
+                // applies only to the offscreen path intermediate.
+                sample_count: 1,
+                viewport_size,
+                bounds: custom.bounds,
+                content_mask: custom.content_mask,
+            });
+
+            unsafe {
+                devices
+                    .device_context
+                    .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+                devices
+                    .device_context
+                    .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+                if let Some(rasterizer_state) = rasterizer_state.as_ref() {
+                    devices.device_context.RSSetState(rasterizer_state);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn draw_underlines(&mut self, start: usize, len: usize) -> Result<()> {
