@@ -4993,6 +4993,30 @@ impl Window {
         });
     }
 
+    /// Paint an application-supplied GPU pass into the scene for the next frame
+    /// at the current z-index.
+    ///
+    /// `payload` is opaque to GPUI; the active renderer backend downcasts it to
+    /// its own handle type. Build it with the helper for the backend you are
+    /// targeting — `MetalDrawHandle::new` or `WgpuDrawHandle::new` — and see
+    /// [`PaintCustom`](crate::PaintCustom) for the contract it has to keep.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_custom(&mut self, bounds: Bounds<Pixels>, payload: Arc<dyn std::any::Any>) {
+        use crate::PaintCustom;
+
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintCustom {
+            order: 0,
+            bounds,
+            content_mask,
+            payload,
+        });
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {

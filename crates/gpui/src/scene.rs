@@ -9,10 +9,12 @@ use crate::{
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
+    any::Any,
     fmt::Debug,
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -50,6 +52,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub customs: Vec<PaintCustom>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +69,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.customs.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -133,6 +137,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::Custom(custom) => {
+                custom.order = order;
+                self.customs.push(custom.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -160,6 +168,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.customs.sort_by_key(|custom| custom.order);
     }
 
     #[cfg_attr(
@@ -187,6 +196,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            customs_start: 0,
+            customs_iter: self.customs.iter().peekable(),
         }
     }
 }
@@ -209,6 +220,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    Custom,
 }
 
 pub(crate) enum PaintOperation {
@@ -228,6 +240,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    Custom(PaintCustom),
 }
 
 #[expect(missing_docs)]
@@ -242,6 +255,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::Custom(custom) => &custom.bounds,
         }
     }
 
@@ -255,6 +269,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::Custom(custom) => &custom.content_mask,
         }
     }
 }
@@ -283,6 +298,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    customs_start: usize,
+    customs_iter: Peekable<slice::Iter<'a, PaintCustom>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -315,6 +332,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.customs_iter.peek().map(|c| c.order),
+                PrimitiveKind::Custom,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -461,6 +482,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::Custom => {
+                let customs_start = self.customs_start;
+                let mut customs_end = customs_start + 1;
+                self.customs_iter.next();
+                while self
+                    .customs_iter
+                    .next_if(|custom| (custom.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    customs_end += 1;
+                }
+                self.customs_start = customs_end;
+                Some(PrimitiveBatch::Customs(customs_start..customs_end))
+            }
         }
     }
 }
@@ -493,6 +528,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    Customs(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -525,6 +561,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::Customs(range) => format!("customs ({})", range.len()),
         }
     }
 }
@@ -776,6 +813,143 @@ pub struct PaintSurface {
 impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
+    }
+}
+
+/// An application-supplied GPU pass, ordered in the scene like any other
+/// primitive.
+///
+/// GPUI's own primitives cover what user interfaces need. This one exists for
+/// what they do not: a canvas whose geometry is too large, or too dependent on
+/// zoom, to tessellate on the CPU every frame, and which is better served by a
+/// pipeline of its own. Handing such a canvas to GPUI as a texture instead
+/// costs a full CPU round trip per frame, which is not a high-refresh-rate
+/// proposition.
+///
+/// # The payload is opaque
+///
+/// GPUI core knows nothing about what is inside `payload`. Each renderer
+/// backend downcasts it to the one concrete handle type it understands and
+/// skips payloads belonging to another backend:
+///
+/// - Metal: `gpui_apple::custom_draw::MetalDrawHandle`
+/// - WGPU: `gpui_wgpu::custom_draw::WgpuDrawHandle`
+///
+/// This keeps `metal` and `wgpu` types out of GPUI core, at the cost of one
+/// implementation per backend you intend to support. That cost is already
+/// unavoidable: the shading language differs per backend regardless.
+///
+/// A payload no backend recognises is silently ignored, so a canvas written
+/// against Metal draws nothing rather than failing to build when the same
+/// application is compiled for the WGPU renderer.
+///
+/// # Ordering and state
+///
+/// The pass is drawn in scene order, so GPUI chrome painted over the canvas
+/// stays over it. The callback draws into GPUI's live render pass. It may leave
+/// behind pipeline state, vertex buffers and bind groups — every GPUI batch
+/// sets its own before drawing — but a scissor rect is reset by the renderer
+/// after the callback returns, because GPUI otherwise relies on the default.
+#[derive(Clone)]
+pub struct PaintCustom {
+    /// Position in the scene's draw order. Assigned by [`Scene::insert_primitive`].
+    pub order: DrawOrder,
+    /// The region, in device pixels, the pass is expected to draw within.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The clip region in force. GPUI passes content masks to its own shaders
+    /// rather than using a scissor rect, so a custom pass must honour this
+    /// itself — either in its shader or by setting a scissor rect from it.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Downcast by the renderer backend to its own handle type.
+    ///
+    /// Deliberately not `Send + Sync`: a scene is built and drawn on the same
+    /// thread, and requiring it would rule out holding GPU resources on targets
+    /// where they are thread-bound, such as WGPU on wasm.
+    pub payload: Arc<dyn Any>,
+}
+
+impl From<PaintCustom> for Primitive {
+    fn from(custom: PaintCustom) -> Self {
+        Primitive::Custom(custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bounds_at(x: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(0.)),
+            size: Size {
+                width: ScaledPixels(10.),
+                height: ScaledPixels(10.),
+            },
+        }
+    }
+
+    fn quad(bounds: Bounds<ScaledPixels>) -> Quad {
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            ..Default::default()
+        }
+    }
+
+    fn custom(bounds: Bounds<ScaledPixels>) -> PaintCustom {
+        PaintCustom {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            payload: Arc::new(()),
+        }
+    }
+
+    /// A custom pass has to interleave with the primitives around it, or GPUI
+    /// chrome painted over a canvas would end up under it.
+    #[test]
+    fn a_custom_pass_batches_in_scene_order() {
+        let bounds = bounds_at(0.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(bounds));
+        scene.insert_primitive(custom(bounds));
+        scene.insert_primitive(quad(bounds));
+        scene.finish();
+
+        let batches: Vec<String> = scene.batches().map(|batch| batch.label()).collect();
+        assert_eq!(batches, ["quads (1)", "customs (1)", "quads (1)"]);
+    }
+
+    /// Consecutive passes at increasing orders stay separate batches, so each
+    /// one's callback runs where it was painted.
+    #[test]
+    fn adjacent_custom_passes_do_not_merge_across_a_quad() {
+        let bounds = bounds_at(0.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(custom(bounds));
+        scene.insert_primitive(custom(bounds));
+        scene.finish();
+
+        // Both overlap, so they take distinct orders but no other kind sits
+        // between them: one batch of two.
+        let batches: Vec<String> = scene.batches().map(|batch| batch.label()).collect();
+        assert_eq!(batches, ["customs (2)"]);
+    }
+
+    /// Culling applies to custom passes like any other primitive, so an
+    /// off-screen canvas costs nothing — and its callback is not invoked.
+    #[test]
+    fn a_custom_pass_clipped_away_is_dropped() {
+        let mut scene = Scene::default();
+        let mut offscreen = custom(bounds_at(0.));
+        offscreen.content_mask = ContentMask {
+            bounds: bounds_at(100.),
+        };
+        scene.insert_primitive(offscreen);
+        scene.finish();
+
+        assert!(scene.customs.is_empty());
+        assert_eq!(scene.batches().count(), 0);
     }
 }
 

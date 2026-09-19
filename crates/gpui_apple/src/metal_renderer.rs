@@ -1,3 +1,4 @@
+use crate::custom_draw::{MetalDrawCx, MetalDrawHandle};
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block::ConcreteBlock;
@@ -7,8 +8,8 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintCustom, PaintSurface, Path,
+    Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -738,6 +739,9 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::Customs(range) => {
+                    self.draw_customs(&scene.customs[range], viewport_size, command_encoder)
+                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
@@ -1120,6 +1124,55 @@ impl MetalRenderer {
             sprites.len() as u64,
             sprites.start as u64,
         );
+    }
+
+    /// Hand each application-supplied pass the live encoder, in scene order.
+    ///
+    /// The pass encodes into GPUI's main render pass rather than getting one of
+    /// its own, which keeps it cheap: no attachment switch, no resolve, no
+    /// composite. That is sound because every `draw_*` helper here binds its own
+    /// pipeline state, vertex buffers and fragment buffers before drawing, so a
+    /// callback cannot leave those in a state that corrupts a later batch.
+    ///
+    /// The scissor rect is the exception, so it is reset below.
+    fn draw_customs(
+        &self,
+        customs: &[PaintCustom],
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) {
+        for custom in customs {
+            let Some(handle) = custom.payload.downcast_ref::<MetalDrawHandle>() else {
+                // A payload built for a different renderer backend. Skipped
+                // rather than treated as an error, so that one application can
+                // carry passes for several backends and run against any of them.
+                continue;
+            };
+
+            handle.0.draw(MetalDrawCx {
+                device: &self.device,
+                command_encoder,
+                pixel_format: MTLPixelFormat::BGRA8Unorm,
+                // The main pass is single-sampled: `PATH_SAMPLE_COUNT` applies
+                // only to the offscreen path intermediate, which is resolved and
+                // composited back into this pass as sprites.
+                sample_count: 1,
+                viewport_size,
+                bounds: custom.bounds,
+                content_mask: custom.content_mask,
+            });
+
+            // GPUI never calls `set_scissor_rect`, so it depends on the pass
+            // default of the full attachment. A callback that set one would
+            // otherwise silently clip every batch after it, because the encoder
+            // holds that state until the pass ends.
+            command_encoder.set_scissor_rect(metal::MTLScissorRect {
+                x: 0,
+                y: 0,
+                width: viewport_size.width.0.max(0) as u64,
+                height: viewport_size.height.0.max(0) as u64,
+            });
+        }
     }
 
     fn draw_surfaces(

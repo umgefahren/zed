@@ -385,6 +385,14 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                // Application-supplied passes are not implemented by the DirectX
+                // renderer yet. `gpui::PaintCustom` payloads are backend-specific,
+                // so this needs a `DirectXDrawHandle` and a context carrying
+                // `ID3D11Device`/`ID3D11DeviceContext`, plus a decision about
+                // which of the immediate-mode context's state a callback may
+                // leave behind. Until then such a payload draws nothing here
+                // rather than failing the frame.
+                PrimitiveBatch::Customs(_customs) => Ok(()),
             }
             .with_context(|| {
                 format!(

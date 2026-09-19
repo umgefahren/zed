@@ -1,3 +1,4 @@
+use crate::custom_draw::{WgpuDrawCx, WgpuDrawHandle};
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
@@ -1529,6 +1530,55 @@ impl WgpuRenderer {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    // Hand each application-supplied pass the live render pass,
+                    // in scene order. Encoding into GPUI's own pass rather than
+                    // a fresh one keeps it cheap, and is sound because every
+                    // GPUI batch binds its own pipeline and bind groups before
+                    // drawing. The scissor rect is the exception, so it is reset
+                    // after each callback.
+                    PrimitiveBatch::Customs(range) => {
+                        let customs = &scene.customs[range];
+                        if !customs.is_empty() {
+                            let device = self.resources().device.clone();
+                            let queue = self.resources().queue.clone();
+                            let format = self.surface_config.format;
+                            let viewport_size = Size {
+                                width: DevicePixels::from(self.surface_config.width as i32),
+                                height: DevicePixels::from(self.surface_config.height as i32),
+                            };
+
+                            for custom in customs {
+                                // A payload built for a different renderer
+                                // backend. Skipped rather than treated as an
+                                // error, so that one application can carry
+                                // passes for several backends.
+                                let Some(handle) = custom.payload.downcast_ref::<WgpuDrawHandle>()
+                                else {
+                                    continue;
+                                };
+
+                                handle.0.draw(WgpuDrawCx {
+                                    device: &device,
+                                    queue: &queue,
+                                    pass: &mut pass,
+                                    format,
+                                    // The main pass is single-sampled; only the
+                                    // offscreen path intermediate is MSAA.
+                                    sample_count: 1,
+                                    viewport_size,
+                                    bounds: custom.bounds,
+                                    content_mask: custom.content_mask,
+                                });
+
+                                pass.set_scissor_rect(
+                                    0,
+                                    0,
+                                    self.surface_config.width,
+                                    self.surface_config.height,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }

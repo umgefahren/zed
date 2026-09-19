@@ -4,5 +4,8 @@
 //! This crate contains the Metal renderer and GPU resource management shared
 //! by GPUI's Apple platform backends.
 
+pub mod custom_draw;
 mod metal_atlas;
 pub mod metal_renderer;
+
+pub use custom_draw::{MetalCustomDraw, MetalDrawCx, MetalDrawHandle};
